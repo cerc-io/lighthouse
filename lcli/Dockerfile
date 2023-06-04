@@ -6,7 +6,7 @@ RUN apt-get update && apt-get -y upgrade && apt-get install -y cmake libclang-de
 COPY . lighthouse
 ARG PORTABLE
 ENV PORTABLE $PORTABLE
-RUN cd lighthouse && make install-lcli
+RUN if [ "$PORTABLE" = true ] ; then export FEATURES=portable; fi && cd lighthouse && make install-lcli
 
 FROM ubuntu:22.04
 RUN apt-get update && apt-get -y upgrade && apt-get clean && rm -rf /var/lib/apt/lists/*
