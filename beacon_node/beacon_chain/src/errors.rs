@@ -24,7 +24,7 @@ use state_processing::{
     },
     signature_sets::Error as SignatureSetError,
     state_advance::Error as StateAdvanceError,
-    BlockProcessingError, BlockReplayError, SlotProcessingError,
+    BlockProcessingError, BlockReplayError, EpochProcessingError, SlotProcessingError,
 };
 use std::time::Duration;
 use task_executor::ShutdownReason;
@@ -60,6 +60,7 @@ pub enum BeaconChainError {
     MissingBeaconBlock(Hash256),
     MissingBeaconState(Hash256),
     SlotProcessingError(SlotProcessingError),
+    EpochProcessingError(EpochProcessingError),
     StateAdvanceError(StateAdvanceError),
     UnableToAdvanceState(String),
     NoStateForAttestation {
@@ -145,6 +146,8 @@ pub enum BeaconChainError {
     BlockVariantLacksExecutionPayload(Hash256),
     ExecutionLayerErrorPayloadReconstruction(ExecutionBlockHash, Box<execution_layer::Error>),
     EngineGetCapabilititesFailed(Box<execution_layer::Error>),
+    ExecutionLayerGetBlockByNumberFailed(Box<execution_layer::Error>),
+    ExecutionLayerGetBlockByHashFailed(Box<execution_layer::Error>),
     BlockHashMissingFromExecutionLayer(ExecutionBlockHash),
     InconsistentPayloadReconstructed {
         slot: Slot,
@@ -213,9 +216,11 @@ pub enum BeaconChainError {
     BlsToExecutionConflictsWithPool,
     InconsistentFork(InconsistentFork),
     ProposerHeadForkChoiceError(fork_choice::Error<proto_array::Error>),
+    UnableToPublish,
 }
 
 easy_from_to!(SlotProcessingError, BeaconChainError);
+easy_from_to!(EpochProcessingError, BeaconChainError);
 easy_from_to!(AttestationValidationError, BeaconChainError);
 easy_from_to!(SyncCommitteeMessageValidationError, BeaconChainError);
 easy_from_to!(ExitValidationError, BeaconChainError);

@@ -1,7 +1,7 @@
 use account_utils::eth2_keystore::keypair_from_secret;
 use clap::ArgMatches;
 use clap_utils::{parse_optional, parse_required, parse_ssz_optional};
-use eth2_network_config::Eth2NetworkConfig;
+use eth2_network_config::{Eth2NetworkConfig, GenesisStateSource};
 use eth2_wallet::bip39::Seed;
 use eth2_wallet::bip39::{Language, Mnemonic};
 use eth2_wallet::{recover_validator_secret_from_mnemonic, KeyType};
@@ -190,7 +190,8 @@ pub fn run<T: EthSpec>(testnet_dir_path: PathBuf, matches: &ArgMatches) -> Resul
     let testnet = Eth2NetworkConfig {
         deposit_contract_deploy_block,
         boot_enr: Some(vec![]),
-        genesis_state_bytes,
+        genesis_state_bytes: genesis_state_bytes.map(Into::into),
+        genesis_state_source: GenesisStateSource::IncludedBytes,
         config: Config::from_chain_spec::<T>(&spec),
     };
 
@@ -303,7 +304,7 @@ fn initialize_state_with_validators<T: EthSpec>(
     }
 
     // Now that we have our validators, initialize the caches (including the committees)
-    state.build_all_caches(spec).unwrap();
+    state.build_caches(spec).unwrap();
 
     // Set genesis validators root for domain separation and chain versioning
     *state.genesis_validators_root_mut() = state.update_validators_tree_hash_cache().unwrap();

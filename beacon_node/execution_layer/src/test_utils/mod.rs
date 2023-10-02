@@ -25,7 +25,7 @@ use warp::{http::StatusCode, Filter, Rejection};
 use crate::EngineCapabilities;
 pub use execution_block_generator::{generate_pow_block, Block, ExecutionBlockGenerator};
 pub use hook::Hook;
-pub use mock_builder::{Context as MockBuilderContext, MockBuilder, Operation, TestingBuilder};
+pub use mock_builder::{Context as MockBuilderContext, MockBuilder, MockBuilderServer, Operation};
 pub use mock_execution_layer::MockExecutionLayer;
 
 pub const DEFAULT_TERMINAL_DIFFICULTY: u64 = 6400;
@@ -43,7 +43,6 @@ pub const DEFAULT_ENGINE_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     get_payload_bodies_by_range_v1: true,
     get_payload_v1: true,
     get_payload_v2: true,
-    exchange_transition_configuration_v1: true,
 };
 
 mod execution_block_generator;

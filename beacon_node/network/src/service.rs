@@ -1,5 +1,6 @@
 use super::sync::manager::RequestId as SyncId;
-use crate::beacon_processor::InvalidBlockStorage;
+use crate::nat::EstablishedUPnPMappings;
+use crate::network_beacon_processor::InvalidBlockStorage;
 use crate::persisted_dht::{clear_dht, load_dht, persist_dht};
 use crate::router::{Router, RouterMessage};
 use crate::subnet_service::SyncCommitteeService;
@@ -9,6 +10,7 @@ use crate::{
     NetworkConfig,
 };
 use beacon_chain::{BeaconChain, BeaconChainTypes};
+use beacon_processor::{work_reprocessing_queue::ReprocessQueueMessage, BeaconProcessorSend};
 use futures::channel::mpsc::Sender;
 use futures::future::OptionFuture;
 use futures::prelude::*;
@@ -25,7 +27,7 @@ use lighthouse_network::{
     MessageId, NetworkEvent, NetworkGlobals, PeerId,
 };
 use slog::{crit, debug, error, info, o, trace, warn};
-use std::{collections::HashSet, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::HashSet, pin::Pin, sync::Arc, time::Duration};
 use store::HotColdDB;
 use strum::IntoStaticStr;
 use task_executor::ShutdownReason;
@@ -92,12 +94,10 @@ pub enum NetworkMessage<T: EthSpec> {
         /// The result of the validation
         validation_result: MessageAcceptance,
     },
-    /// Called if a known external TCP socket address has been updated.
+    /// Called if  UPnP managed to establish an external port mapping.
     UPnPMappingEstablished {
-        /// The external TCP address has been updated.
-        tcp_socket: Option<SocketAddr>,
-        /// The external UDP address has been updated.
-        udp_socket: Option<SocketAddr>,
+        /// The mappings that were established.
+        mappings: EstablishedUPnPMappings,
     },
     /// Reports a peer to the peer manager for performing an action.
     ReportPeer {
@@ -189,11 +189,8 @@ pub struct NetworkService<T: BeaconChainTypes> {
     /// A collection of global variables, accessible outside of the network service.
     network_globals: Arc<NetworkGlobals<T::EthSpec>>,
     /// Stores potentially created UPnP mappings to be removed on shutdown. (TCP port and UDP
-    /// port).
-    upnp_mappings: (Option<u16>, Option<u16>),
-    /// Keeps track of if discovery is auto-updating or not. This is used to inform us if we should
-    /// update the UDP socket of discovery if the UPnP mappings get established.
-    discovery_auto_update: bool,
+    /// ports).
+    upnp_mappings: EstablishedUPnPMappings,
     /// A delay that expires when a new fork takes place.
     next_fork_update: Pin<Box<OptionFuture<Sleep>>>,
     /// A delay that expires when we need to subscribe to a new fork's topics.
@@ -224,10 +221,18 @@ impl<T: BeaconChainTypes> NetworkService<T> {
         config: &NetworkConfig,
         executor: task_executor::TaskExecutor,
         gossipsub_registry: Option<&'_ mut Registry>,
+        beacon_processor_send: BeaconProcessorSend<T::EthSpec>,
+        beacon_processor_reprocess_tx: mpsc::Sender<ReprocessQueueMessage>,
     ) -> error::Result<(Arc<NetworkGlobals<T::EthSpec>>, NetworkSenders<T::EthSpec>)> {
         let network_log = executor.log().clone();
         // build the channels for external comms
         let (network_senders, network_recievers) = NetworkSenders::new();
+
+        #[cfg(feature = "disable-backfill")]
+        warn!(
+            network_log,
+            "Backfill is disabled. DO NOT RUN IN PRODUCTION"
+        );
 
         // try and construct UPnP port mappings if required.
         if let Some(upnp_config) = crate::nat::UPnPConfig::from_config(config) {
@@ -311,14 +316,15 @@ impl<T: BeaconChainTypes> NetworkService<T> {
             network_senders.network_send(),
             executor.clone(),
             invalid_block_storage,
+            beacon_processor_send,
+            beacon_processor_reprocess_tx,
             network_log.clone(),
         )?;
 
         // attestation subnet service
         let attestation_service = AttestationService::new(
             beacon_chain.clone(),
-            #[cfg(feature = "deterministic_long_lived_attnets")]
-            network_globals.local_enr().node_id().raw().into(),
+            network_globals.local_enr().node_id(),
             config,
             &network_log,
         );
@@ -349,8 +355,7 @@ impl<T: BeaconChainTypes> NetworkService<T> {
             router_send,
             store,
             network_globals: network_globals.clone(),
-            upnp_mappings: (None, None),
-            discovery_auto_update: config.discv5_config.enr_update,
+            upnp_mappings: EstablishedUPnPMappings::default(),
             next_fork_update,
             next_fork_subscriptions,
             next_unsubscribe,
@@ -483,10 +488,8 @@ impl<T: BeaconChainTypes> NetworkService<T> {
             NetworkEvent::PeerConnectedOutgoing(peer_id) => {
                 self.send_to_router(RouterMessage::StatusPeer(peer_id));
             }
-            NetworkEvent::PeerConnectedIncoming(_)
-            | NetworkEvent::PeerBanned(_)
-            | NetworkEvent::PeerUnbanned(_) => {
-                // No action required for these events.
+            NetworkEvent::PeerConnectedIncoming(_) => {
+                // No action required for this event.
             }
             NetworkEvent::PeerDisconnected(peer_id) => {
                 self.send_to_router(RouterMessage::PeerDisconnected(peer_id));
@@ -608,32 +611,18 @@ impl<T: BeaconChainTypes> NetworkService<T> {
             } => {
                 self.libp2p.send_error_reponse(peer_id, id, error, reason);
             }
-            NetworkMessage::UPnPMappingEstablished {
-                tcp_socket,
-                udp_socket,
-            } => {
-                self.upnp_mappings = (tcp_socket.map(|s| s.port()), udp_socket.map(|s| s.port()));
+            NetworkMessage::UPnPMappingEstablished { mappings } => {
+                self.upnp_mappings = mappings;
                 // If there is an external TCP port update, modify our local ENR.
-                if let Some(tcp_socket) = tcp_socket {
-                    if let Err(e) = self
-                        .libp2p
-                        .discovery_mut()
-                        .update_enr_tcp_port(tcp_socket.port())
-                    {
+                if let Some(tcp_port) = self.upnp_mappings.tcp_port {
+                    if let Err(e) = self.libp2p.discovery_mut().update_enr_tcp_port(tcp_port) {
                         warn!(self.log, "Failed to update ENR"; "error" => e);
                     }
                 }
-                // if the discovery service is not auto-updating, update it with the
-                // UPnP mappings
-                if !self.discovery_auto_update {
-                    if let Some(udp_socket) = udp_socket {
-                        if let Err(e) = self
-                            .libp2p
-                            .discovery_mut()
-                            .update_enr_udp_socket(udp_socket)
-                        {
-                            warn!(self.log, "Failed to update ENR"; "error" => e);
-                        }
+                // If there is an external QUIC port update, modify our local ENR.
+                if let Some(quic_port) = self.upnp_mappings.udp_quic_port {
+                    if let Err(e) = self.libp2p.discovery_mut().update_enr_quic_port(quic_port) {
+                        warn!(self.log, "Failed to update ENR"; "error" => e);
                     }
                 }
             }
@@ -986,7 +975,7 @@ impl<T: BeaconChainTypes> Drop for NetworkService<T> {
         }
 
         // attempt to remove port mappings
-        crate::nat::remove_mappings(self.upnp_mappings.0, self.upnp_mappings.1, &self.log);
+        crate::nat::remove_mappings(&self.upnp_mappings, &self.log);
 
         info!(self.log, "Network service shutdown");
     }

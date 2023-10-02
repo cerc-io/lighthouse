@@ -17,12 +17,11 @@ use bls::get_withdrawal_credentials;
 use execution_layer::{
     auth::JwtKey,
     test_utils::{
-        ExecutionBlockGenerator, MockExecutionLayer, TestingBuilder, DEFAULT_JWT_SECRET,
-        DEFAULT_TERMINAL_BLOCK,
+        ExecutionBlockGenerator, MockBuilder, MockBuilderServer, MockExecutionLayer,
+        DEFAULT_JWT_SECRET, DEFAULT_TERMINAL_BLOCK,
     },
     ExecutionLayer,
 };
-use fork_choice::CountUnrealized;
 use futures::channel::mpsc::Receiver;
 pub use genesis::{interop_genesis_state_with_eth1, DEFAULT_ETH1_BLOCK_HASH};
 use int_to_bytes::int_to_bytes32;
@@ -168,7 +167,6 @@ pub struct Builder<T: BeaconChainTypes> {
     store_mutator: Option<BoxedMutator<T::EthSpec, T::HotStore, T::ColdStore>>,
     execution_layer: Option<ExecutionLayer<T::EthSpec>>,
     mock_execution_layer: Option<MockExecutionLayer<T::EthSpec>>,
-    mock_builder: Option<TestingBuilder<T::EthSpec>>,
     testing_slot_clock: Option<TestingSlotClock>,
     runtime: TestRuntime,
     log: Logger,
@@ -302,7 +300,6 @@ where
             store_mutator: None,
             execution_layer: None,
             mock_execution_layer: None,
-            mock_builder: None,
             testing_slot_clock: None,
             runtime,
             log,
@@ -434,7 +431,11 @@ where
         self
     }
 
-    pub fn mock_execution_layer(mut self) -> Self {
+    pub fn mock_execution_layer(self) -> Self {
+        self.mock_execution_layer_with_config(None)
+    }
+
+    pub fn mock_execution_layer_with_config(mut self, builder_threshold: Option<u128>) -> Self {
         let spec = self.spec.clone().expect("cannot build without spec");
         let shanghai_time = spec.capella_fork_epoch.map(|epoch| {
             HARNESS_GENESIS_TIME + spec.seconds_per_slot * E::slots_per_epoch() * epoch.as_u64()
@@ -443,52 +444,12 @@ where
             self.runtime.task_executor.clone(),
             DEFAULT_TERMINAL_BLOCK,
             shanghai_time,
-            None,
+            builder_threshold,
             Some(JwtKey::from_slice(&DEFAULT_JWT_SECRET).unwrap()),
             spec,
-            None,
         );
         self.execution_layer = Some(mock.el.clone());
         self.mock_execution_layer = Some(mock);
-        self
-    }
-
-    pub fn mock_execution_layer_with_builder(
-        mut self,
-        beacon_url: SensitiveUrl,
-        builder_threshold: Option<u128>,
-    ) -> Self {
-        // Get a random unused port
-        let port = unused_port::unused_tcp4_port().unwrap();
-        let builder_url = SensitiveUrl::parse(format!("http://127.0.0.1:{port}").as_str()).unwrap();
-
-        let spec = self.spec.clone().expect("cannot build without spec");
-        let shanghai_time = spec.capella_fork_epoch.map(|epoch| {
-            HARNESS_GENESIS_TIME + spec.seconds_per_slot * E::slots_per_epoch() * epoch.as_u64()
-        });
-        let mock_el = MockExecutionLayer::new(
-            self.runtime.task_executor.clone(),
-            DEFAULT_TERMINAL_BLOCK,
-            shanghai_time,
-            builder_threshold,
-            Some(JwtKey::from_slice(&DEFAULT_JWT_SECRET).unwrap()),
-            spec.clone(),
-            Some(builder_url.clone()),
-        )
-        .move_to_terminal_block();
-
-        let mock_el_url = SensitiveUrl::parse(mock_el.server.url().as_str()).unwrap();
-
-        self.mock_builder = Some(TestingBuilder::new(
-            mock_el_url,
-            builder_url,
-            beacon_url,
-            spec,
-            self.runtime.task_executor.clone(),
-        ));
-        self.execution_layer = Some(mock_el.el.clone());
-        self.mock_execution_layer = Some(mock_el);
-
         self
     }
 
@@ -517,18 +478,23 @@ where
         let validator_keypairs = self
             .validator_keypairs
             .expect("cannot build without validator keypairs");
+        let chain_config = self.chain_config.unwrap_or_default();
 
         let mut builder = BeaconChainBuilder::new(self.eth_spec_instance)
             .logger(log.clone())
             .custom_spec(spec)
             .store(self.store.expect("cannot build without store"))
-            .store_migrator_config(MigratorConfig::default().blocking())
+            .store_migrator_config(
+                MigratorConfig::default()
+                    .blocking()
+                    .epochs_per_migration(chain_config.epochs_per_migration),
+            )
             .task_executor(self.runtime.task_executor.clone())
             .execution_layer(self.execution_layer)
             .dummy_eth1_backend()
             .expect("should build dummy backend")
             .shutdown_sender(shutdown_tx)
-            .chain_config(self.chain_config.unwrap_or_default())
+            .chain_config(chain_config)
             .event_handler(Some(ServerSentEventHandler::new_with_capacity(
                 log.clone(),
                 5,
@@ -568,7 +534,7 @@ where
             shutdown_receiver: Arc::new(Mutex::new(shutdown_receiver)),
             runtime: self.runtime,
             mock_execution_layer: self.mock_execution_layer,
-            mock_builder: self.mock_builder.map(Arc::new),
+            mock_builder: None,
             rng: make_rng(),
         }
     }
@@ -593,7 +559,7 @@ pub struct BeaconChainHarness<T: BeaconChainTypes> {
     pub runtime: TestRuntime,
 
     pub mock_execution_layer: Option<MockExecutionLayer<T::EthSpec>>,
-    pub mock_builder: Option<Arc<TestingBuilder<T::EthSpec>>>,
+    pub mock_builder: Option<Arc<MockBuilder<T::EthSpec>>>,
 
     pub rng: Mutex<StdRng>,
 }
@@ -627,6 +593,49 @@ where
             .expect("harness was not built with mock execution layer")
             .server
             .execution_block_generator()
+    }
+
+    pub fn set_mock_builder(&mut self, beacon_url: SensitiveUrl) -> MockBuilderServer {
+        let mock_el = self
+            .mock_execution_layer
+            .as_ref()
+            .expect("harness was not built with mock execution layer");
+
+        let mock_el_url = SensitiveUrl::parse(mock_el.server.url().as_str()).unwrap();
+
+        // Create the builder, listening on a free port.
+        let (mock_builder, mock_builder_server) = MockBuilder::new_for_testing(
+            mock_el_url,
+            beacon_url,
+            self.spec.clone(),
+            self.runtime.task_executor.clone(),
+        );
+
+        // Set the builder URL in the execution layer now that its port is known.
+        let builder_listen_addr = mock_builder_server.local_addr();
+        let port = builder_listen_addr.port();
+        mock_el
+            .el
+            .set_builder_url(
+                SensitiveUrl::parse(format!("http://127.0.0.1:{port}").as_str()).unwrap(),
+                None,
+            )
+            .unwrap();
+
+        self.mock_builder = Some(Arc::new(mock_builder));
+
+        // Sanity check.
+        let el_builder = self
+            .chain
+            .execution_layer
+            .as_ref()
+            .unwrap()
+            .builder()
+            .unwrap();
+        let mock_el_builder = mock_el.el.builder().unwrap();
+        assert!(Arc::ptr_eq(&el_builder, &mock_el_builder));
+
+        mock_builder_server
     }
 
     pub fn get_all_validators(&self) -> Vec<usize> {
@@ -734,6 +743,15 @@ where
         state.get_block_root(slot).unwrap() == state.get_block_root(slot - 1).unwrap()
     }
 
+    pub async fn make_blinded_block(
+        &self,
+        state: BeaconState<E>,
+        slot: Slot,
+    ) -> (SignedBlindedBeaconBlock<E>, BeaconState<E>) {
+        let (unblinded, new_state) = self.make_block(state, slot).await;
+        (unblinded.into(), new_state)
+    }
+
     /// Returns a newly created block, signed by the proposer for the given slot.
     pub async fn make_block(
         &self,
@@ -746,9 +764,7 @@ where
         complete_state_advance(&mut state, None, slot, &self.spec)
             .expect("should be able to advance state to slot");
 
-        state
-            .build_all_caches(&self.spec)
-            .expect("should build caches");
+        state.build_caches(&self.spec).expect("should build caches");
 
         let proposer_index = state.get_beacon_proposer_index(slot, &self.spec).unwrap();
 
@@ -795,9 +811,7 @@ where
         complete_state_advance(&mut state, None, slot, &self.spec)
             .expect("should be able to advance state to slot");
 
-        state
-            .build_all_caches(&self.spec)
-            .expect("should build caches");
+        state.build_caches(&self.spec).expect("should build caches");
 
         let proposer_index = state.get_beacon_proposer_index(slot, &self.spec).unwrap();
 
@@ -1515,6 +1529,36 @@ where
         .sign(sk, &fork, genesis_validators_root, &self.chain.spec)
     }
 
+    pub fn add_proposer_slashing(&self, validator_index: u64) -> Result<(), String> {
+        let propposer_slashing = self.make_proposer_slashing(validator_index);
+        if let ObservationOutcome::New(verified_proposer_slashing) = self
+            .chain
+            .verify_proposer_slashing_for_gossip(propposer_slashing)
+            .expect("should verify proposer slashing for gossip")
+        {
+            self.chain
+                .import_proposer_slashing(verified_proposer_slashing);
+            Ok(())
+        } else {
+            Err("should observe new proposer slashing".to_string())
+        }
+    }
+
+    pub fn add_attester_slashing(&self, validator_indices: Vec<u64>) -> Result<(), String> {
+        let attester_slashing = self.make_attester_slashing(validator_indices);
+        if let ObservationOutcome::New(verified_attester_slashing) = self
+            .chain
+            .verify_attester_slashing_for_gossip(attester_slashing)
+            .expect("should verify attester slashing for gossip")
+        {
+            self.chain
+                .import_attester_slashing(verified_attester_slashing);
+            Ok(())
+        } else {
+            Err("should observe new attester slashing".to_string())
+        }
+    }
+
     pub fn add_bls_to_execution_change(
         &self,
         validator_index: u64,
@@ -1696,8 +1740,8 @@ where
             .process_block(
                 block_root,
                 Arc::new(block),
-                CountUnrealized::True,
                 NotifyExecutionLayer::Yes,
+                || Ok(()),
             )
             .await?
             .into();
@@ -1714,8 +1758,8 @@ where
             .process_block(
                 block.canonical_root(),
                 Arc::new(block),
-                CountUnrealized::True,
                 NotifyExecutionLayer::Yes,
+                || Ok(()),
             )
             .await?
             .into();

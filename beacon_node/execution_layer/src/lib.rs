@@ -5,6 +5,7 @@
 //! deposit-contract functionality that the `beacon_node/eth1` crate already provides.
 
 use crate::payload_cache::PayloadCache;
+use arc_swap::ArcSwapOption;
 use auth::{strip_prefix, Auth, JwtKey};
 use builder_client::BuilderHttpClient;
 pub use engine_api::EngineCapabilities;
@@ -38,11 +39,11 @@ use tokio::{
 };
 use tokio_stream::wrappers::WatchStream;
 use tree_hash::TreeHash;
-use types::{AbstractExecPayload, BeaconStateError, ExecPayload, Withdrawals};
+use types::{AbstractExecPayload, BeaconStateError, ExecPayload};
 use types::{
-    BlindedPayload, BlockType, ChainSpec, Epoch, ExecutionBlockHash, ExecutionPayload,
-    ExecutionPayloadCapella, ExecutionPayloadMerge, ForkName, ForkVersionedResponse,
-    ProposerPreparationData, PublicKeyBytes, Signature, SignedBeaconBlock, Slot, Uint256,
+    BlindedPayload, BlockType, ChainSpec, Epoch, ExecutionPayloadCapella, ExecutionPayloadMerge,
+    ForkVersionedResponse, ProposerPreparationData, PublicKeyBytes, Signature, SignedBeaconBlock,
+    Slot,
 };
 
 mod block_hash;
@@ -74,11 +75,9 @@ const EXECUTION_BLOCKS_LRU_CACHE_SIZE: usize = 128;
 const DEFAULT_SUGGESTED_FEE_RECIPIENT: [u8; 20] =
     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
-const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(60);
-
 /// A payload alongside some information about where it came from.
 pub enum ProvenancedPayload<P> {
-    /// A good ol' fashioned farm-to-table payload from your local EE.
+    /// A good old fashioned farm-to-table payload from your local EE.
     Local(P),
     /// A payload from a builder (e.g. mev-boost).
     Builder(P),
@@ -163,7 +162,7 @@ impl<T: EthSpec, Payload: AbstractExecPayload<T>> BlockProposalContents<T, Paylo
                 BlockProposalContents::Payload {
                     payload: Payload::default_at_fork(fork_name)?,
                     block_value: Uint256::zero(),
-                    _phantom: PhantomData::default(),
+                    _phantom: PhantomData,
                 }
             }
         })
@@ -211,7 +210,7 @@ pub enum FailedCondition {
 
 struct Inner<E: EthSpec> {
     engine: Arc<Engine>,
-    builder: Option<BuilderHttpClient>,
+    builder: ArcSwapOption<BuilderHttpClient>,
     execution_engine_forkchoice_lock: Mutex<()>,
     suggested_fee_recipient: Option<Address>,
     proposer_preparation_data: Mutex<HashMap<u64, ProposerPreparationDataEntry>>,
@@ -326,25 +325,9 @@ impl<T: EthSpec> ExecutionLayer<T> {
             Engine::new(api, executor.clone(), &log)
         };
 
-        let builder = builder_url
-            .map(|url| {
-                let builder_client = BuilderHttpClient::new(url.clone(), builder_user_agent)
-                    .map_err(Error::Builder)?;
-
-                info!(
-                    log,
-                    "Using external block builder";
-                    "builder_url" => ?url,
-                    "builder_profit_threshold" => builder_profit_threshold,
-                    "local_user_agent" => builder_client.get_user_agent(),
-                );
-                Ok::<_, Error>(builder_client)
-            })
-            .transpose()?;
-
         let inner = Inner {
             engine: Arc::new(engine),
-            builder,
+            builder: ArcSwapOption::empty(),
             execution_engine_forkchoice_lock: <_>::default(),
             suggested_fee_recipient,
             proposer_preparation_data: Mutex::new(HashMap::new()),
@@ -358,19 +341,45 @@ impl<T: EthSpec> ExecutionLayer<T> {
             last_new_payload_errored: RwLock::new(false),
         };
 
-        Ok(Self {
+        let el = Self {
             inner: Arc::new(inner),
-        })
-    }
-}
+        };
 
-impl<T: EthSpec> ExecutionLayer<T> {
+        if let Some(builder_url) = builder_url {
+            el.set_builder_url(builder_url, builder_user_agent)?;
+        }
+
+        Ok(el)
+    }
+
     fn engine(&self) -> &Arc<Engine> {
         &self.inner.engine
     }
 
-    pub fn builder(&self) -> &Option<BuilderHttpClient> {
-        &self.inner.builder
+    pub fn builder(&self) -> Option<Arc<BuilderHttpClient>> {
+        self.inner.builder.load_full()
+    }
+
+    /// Set the builder URL after initialization.
+    ///
+    /// This is useful for breaking circular dependencies between mock ELs and mock builders in
+    /// tests.
+    pub fn set_builder_url(
+        &self,
+        builder_url: SensitiveUrl,
+        builder_user_agent: Option<String>,
+    ) -> Result<(), Error> {
+        let builder_client = BuilderHttpClient::new(builder_url.clone(), builder_user_agent)
+            .map_err(Error::Builder)?;
+        info!(
+            self.log(),
+            "Using external block builder";
+            "builder_url" => ?builder_url,
+            "builder_profit_threshold" => self.inner.builder_profit_threshold.as_u128(),
+            "local_user_agent" => builder_client.get_user_agent(),
+        );
+        self.inner.builder.swap(Some(Arc::new(builder_client)));
+        Ok(())
     }
 
     /// Cache a full payload, keyed on the `tree_hash_root` of the payload
@@ -380,7 +389,7 @@ impl<T: EthSpec> ExecutionLayer<T> {
 
     /// Attempt to retrieve a full payload from the payload cache by the payload root
     pub fn get_payload_by_root(&self, root: &Hash256) -> Option<ExecutionPayload<T>> {
-        self.inner.payload_cache.pop(root)
+        self.inner.payload_cache.get(root)
     }
 
     pub fn executor(&self) -> &TaskExecutor {
@@ -502,24 +511,6 @@ impl<T: EthSpec> ExecutionLayer<T> {
         self.spawn(preparation_cleaner, "exec_preparation_cleanup");
     }
 
-    /// Spawns a routine that polls the `exchange_transition_configuration` endpoint.
-    pub fn spawn_transition_configuration_poll(&self, spec: ChainSpec) {
-        let routine = |el: ExecutionLayer<T>| async move {
-            loop {
-                if let Err(e) = el.exchange_transition_configuration(&spec).await {
-                    error!(
-                        el.log(),
-                        "Failed to check transition config";
-                        "error" => ?e
-                    );
-                }
-                sleep(CONFIG_POLL_INTERVAL).await;
-            }
-        };
-
-        self.spawn(routine, "exec_config_poll");
-    }
-
     /// Returns `true` if the execution engine is synced and reachable.
     pub async fn is_synced(&self) -> bool {
         self.engine().is_synced().await
@@ -529,9 +520,9 @@ impl<T: EthSpec> ExecutionLayer<T> {
     ///
     /// This function is a wrapper over `Self::is_synced` that makes an additional
     /// check for the execution layer sync status. Checks if the latest block has
-    /// a `block_number != 0`.
+    /// a `block_number != 0` *if* the `current_slot` is also `> 0`.
     /// Returns the `Self::is_synced` response if unable to get latest block.
-    pub async fn is_synced_for_notifier(&self) -> bool {
+    pub async fn is_synced_for_notifier(&self, current_slot: Slot) -> bool {
         let synced = self.is_synced().await;
         if synced {
             if let Ok(Some(block)) = self
@@ -540,7 +531,7 @@ impl<T: EthSpec> ExecutionLayer<T> {
                 .get_block_by_number(BlockByNumberQuery::Tag(LATEST_TAG))
                 .await
             {
-                if block.block_number == 0 {
+                if block.block_number == 0 && current_slot > 0 {
                     return false;
                 }
             }
@@ -826,16 +817,23 @@ impl<T: EthSpec> ExecutionLayer<T> {
 
                             let relay_value = relay.data.message.value;
                             let local_value = *local.block_value();
-                            if !self.inner.always_prefer_builder_payload
-                                && local_value >= relay_value
-                            {
-                                info!(
-                                    self.log(),
-                                    "Local block is more profitable than relay block";
-                                    "local_block_value" => %local_value,
-                                    "relay_value" => %relay_value
-                                );
-                                return Ok(ProvenancedPayload::Local(local));
+                            if !self.inner.always_prefer_builder_payload {
+                                if local_value >= relay_value {
+                                    info!(
+                                        self.log(),
+                                        "Local block is more profitable than relay block";
+                                        "local_block_value" => %local_value,
+                                        "relay_value" => %relay_value
+                                    );
+                                    return Ok(ProvenancedPayload::Local(local));
+                                } else {
+                                    info!(
+                                        self.log(),
+                                        "Relay block is more profitable than local block";
+                                        "local_block_value" => %local_value,
+                                        "relay_value" => %relay_value
+                                    );
+                                }
                             }
 
                             match verify_builder_bid(
@@ -851,7 +849,7 @@ impl<T: EthSpec> ExecutionLayer<T> {
                                     BlockProposalContents::Payload {
                                         payload: relay.data.message.header,
                                         block_value: relay.data.message.value,
-                                        _phantom: PhantomData::default(),
+                                        _phantom: PhantomData,
                                     },
                                 )),
                                 Err(reason) if !reason.payload_invalid() => {
@@ -906,7 +904,7 @@ impl<T: EthSpec> ExecutionLayer<T> {
                                     BlockProposalContents::Payload {
                                         payload: relay.data.message.header,
                                         block_value: relay.data.message.value,
-                                        _phantom: PhantomData::default(),
+                                        _phantom: PhantomData,
                                     },
                                 )),
                                 // If the payload is valid then use it. The local EE failed
@@ -915,7 +913,7 @@ impl<T: EthSpec> ExecutionLayer<T> {
                                     BlockProposalContents::Payload {
                                         payload: relay.data.message.header,
                                         block_value: relay.data.message.value,
-                                        _phantom: PhantomData::default(),
+                                        _phantom: PhantomData,
                                     },
                                 )),
                                 Err(reason) => {
@@ -1122,7 +1120,7 @@ impl<T: EthSpec> ExecutionLayer<T> {
                 Ok(BlockProposalContents::Payload {
                     payload: execution_payload.into(),
                     block_value,
-                    _phantom: PhantomData::default(),
+                    _phantom: PhantomData,
                 })
             })
             .await
@@ -1309,53 +1307,6 @@ impl<T: EthSpec> ExecutionLayer<T> {
         )
         .map_err(Box::new)
         .map_err(Error::EngineError)
-    }
-
-    pub async fn exchange_transition_configuration(&self, spec: &ChainSpec) -> Result<(), Error> {
-        let local = TransitionConfigurationV1 {
-            terminal_total_difficulty: spec.terminal_total_difficulty,
-            terminal_block_hash: spec.terminal_block_hash,
-            terminal_block_number: 0,
-        };
-
-        let result = self
-            .engine()
-            .request(|engine| engine.api.exchange_transition_configuration_v1(local))
-            .await;
-
-        match result {
-            Ok(remote) => {
-                if local.terminal_total_difficulty != remote.terminal_total_difficulty
-                    || local.terminal_block_hash != remote.terminal_block_hash
-                {
-                    error!(
-                        self.log(),
-                        "Execution client config mismatch";
-                        "msg" => "ensure lighthouse and the execution client are up-to-date and \
-                                  configured consistently",
-                        "remote" => ?remote,
-                        "local" => ?local,
-                    );
-                    Err(Error::EngineError(Box::new(EngineError::Api {
-                        error: ApiError::TransitionConfigurationMismatch,
-                    })))
-                } else {
-                    debug!(
-                        self.log(),
-                        "Execution client config is OK";
-                    );
-                    Ok(())
-                }
-            }
-            Err(e) => {
-                error!(
-                    self.log(),
-                    "Unable to get transition config";
-                    "error" => ?e,
-                );
-                Err(Error::EngineError(Box::new(e)))
-            }
-        }
     }
 
     /// Returns the execution engine capabilities resulting from a call to
@@ -1652,6 +1603,17 @@ impl<T: EthSpec> ExecutionLayer<T> {
             // Fall back to eth_blockByHash.
             self.get_payload_by_hash_legacy(hash, fork).await
         }
+    }
+
+    pub async fn get_block_by_number(
+        &self,
+        query: BlockByNumberQuery<'_>,
+    ) -> Result<Option<ExecutionBlock>, Error> {
+        self.engine()
+            .request(|engine| async move { engine.api.get_block_by_number(query).await })
+            .await
+            .map_err(Box::new)
+            .map_err(Error::EngineError)
     }
 
     pub async fn get_payload_by_hash_legacy(
@@ -2011,6 +1973,22 @@ async fn timed_future<F: Future<Output = T>, T>(metric: &str, future: F) -> (T, 
     (result, duration)
 }
 
+fn noop<T: EthSpec>(
+    _: &ExecutionLayer<T>,
+    _: ExecutionPayloadRef<T>,
+) -> Option<ExecutionPayload<T>> {
+    None
+}
+
+#[cfg(test)]
+/// Returns the duration since the unix epoch.
+fn timestamp_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -2156,20 +2134,4 @@ mod test {
             })
             .await;
     }
-}
-
-fn noop<T: EthSpec>(
-    _: &ExecutionLayer<T>,
-    _: ExecutionPayloadRef<T>,
-) -> Option<ExecutionPayload<T>> {
-    None
-}
-
-#[cfg(test)]
-/// Returns the duration since the unix epoch.
-fn timestamp_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs()
 }
